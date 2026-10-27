@@ -50,6 +50,10 @@ pub struct Config {
     pub size_scale: f32,
     /// Size of the robot once dragged out of the notch (Windows).
     pub pet_scale: f32,
+    /// Accept the phone app on the local network (Windows).
+    pub phone_link: bool,
+    /// Pairing code the phone must send; generated on first use.
+    pub phone_code: String,
 
     // --- phase 2 feature settings ---
     /// Daily water goal, in glasses.
@@ -70,6 +74,8 @@ impl Default for Config {
             autostart: false,
             size_scale: 1.0,
             pet_scale: 1.0,
+            phone_link: false,
+            phone_code: String::new(),
             water_goal: 8,
             pomodoro_work_min: 25,
             pomodoro_short_break_min: 5,

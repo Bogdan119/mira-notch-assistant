@@ -43,6 +43,7 @@ use crate::com::{self, Clip, Target};
 use crate::files::{self, FolderContext, Search};
 use crate::gfx::{self, fade, hex, Align, Argb, Canvas, Face, R};
 use crate::pet::{self, Act, CpuMeter, Eyes, PetKind, Rng};
+use crate::phone;
 use crate::wide;
 
 const OPEN_W: f32 = 640.;
@@ -116,6 +117,9 @@ enum Mode {
     Dragging,
     Pet,
     Returning,
+    /// The phone-shake show: left, right, fill the screen, close the eyes,
+    /// lock the computer.
+    Cinematic,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -258,6 +262,10 @@ struct Host {
     content_dx: f32,
     /// Whether the last tick drew a frame (keeps the vsync loop running).
     rendered: bool,
+    cine_start: Instant,
+    cine_from: (f32, f32),
+    cine_locked: bool,
+    phone: Option<phone::Server>,
 }
 
 thread_local! { static HOST: RefCell<Option<Host>> = const { RefCell::new(None) }; }
@@ -371,6 +379,10 @@ impl Host {
             dirty: true,
             content_dx: 0.,
             rendered: false,
+            cine_start: now,
+            cine_from: (0., 0.),
+            cine_locked: false,
+            phone: None,
         })
     }
 
@@ -454,6 +466,7 @@ impl Host {
     /// Screen rect of the window for the current mode, in device px.
     unsafe fn window_rect(&self) -> (i32, i32, i32, i32) {
         match self.mode {
+            Mode::Cinematic => self.cine_frame().window,
             Mode::Docked => {
                 let m = self.monitor();
                 let (w, h, _) = self.notch_size();
@@ -545,6 +558,7 @@ impl Host {
                 self.dirty = true;
             }
             Mode::Pet => self.tick_pet(now, dt, cursor, inside),
+            Mode::Cinematic => self.tick_cinematic(now),
             Mode::Returning => {
                 let (hx, hy) = self.home();
                 self.pet.go(hx, hy);
@@ -1381,6 +1395,184 @@ impl Host {
         self.dirty = true;
     }
 
+    // --- phone link + shake show ------------------------------------------------
+
+    /// Turn the phone link on (generating a pairing code the first time) and
+    /// return the code to show.
+    unsafe fn enable_phone(&mut self) -> Result<String, String> {
+        if self.config.phone_code.len() != 6 {
+            self.config.phone_code = phone::new_code();
+        }
+        if self.phone.is_none() {
+            let server = phone::start(self.config.phone_code.clone(), self.hwnd).map_err(|e| {
+                if self.ro() {
+                    format!(
+                        "Nu pot porni legătura cu telefonul (port {}): {e}",
+                        phone::PORT
+                    )
+                } else {
+                    format!("Can't start the phone link (port {}): {e}", phone::PORT)
+                }
+            })?;
+            self.phone = Some(server);
+        }
+        self.config.phone_link = true;
+        self.save_config();
+        Ok(self.config.phone_code.clone())
+    }
+
+    fn disable_phone(&mut self) {
+        self.phone = None;
+        self.config.phone_link = false;
+        self.save_config();
+        self.toast(
+            self.tr("Telefon deconectat", "Phone disconnected")
+                .to_string(),
+        );
+    }
+
+    unsafe fn start_cinematic(&mut self) {
+        if self.mode == Mode::Cinematic {
+            return;
+        }
+        self.end_edit();
+        self.press = None;
+        self.cine_from = match self.mode {
+            Mode::Docked => self.home(),
+            _ => (self.pet.x.value, self.pet.y.value),
+        };
+        self.close_panel();
+        self.set_open(false);
+        self.open_anim.snap(0.);
+        self.mode = Mode::Cinematic;
+        self.cine_start = Instant::now();
+        self.cine_locked = false;
+        self.dirty = true;
+    }
+
+    unsafe fn tick_cinematic(&mut self, now: Instant) {
+        let t = now.duration_since(self.cine_start).as_secs_f32();
+        self.dirty = true;
+        if t >= CINE_LOCK && !self.cine_locked {
+            self.cine_locked = true;
+            windows_sys::Win32::System::Shutdown::LockWorkStation();
+        }
+        if t >= CINE_END {
+            // Back in the notch for when the user signs in again.
+            self.mode = Mode::Docked;
+            self.open_anim.snap(0.);
+            self.pet = Pet::new(self.home().0, self.home().1);
+        }
+    }
+
+    /// Where everything is at the current moment of the show (device px).
+    unsafe fn cine_frame(&self) -> CineFrame {
+        let t = self.cine_start.elapsed().as_secs_f32();
+        let m = self.monitor();
+        let (mw, mh) = ((m.right - m.left) as f32, (m.bottom - m.top) as f32);
+        let (ml, mt) = (m.left as f32, m.top as f32);
+        let ps = self.pet_size * self.scale;
+        let (bw, bh) = (BOX_W * ps, BOX_H * ps);
+        let left = (ml + mw * 0.22, mt + mh * 0.5);
+        let right = (ml + mw * 0.78, mt + mh * 0.5);
+        let centre = (ml + mw * 0.5, mt + mh * 0.5);
+        let seg = |a: (f32, f32), b: (f32, f32), k: f32| (lerp(a.0, b.0, k), lerp(a.1, b.1, k));
+        let pos = |t: f32| -> (f32, f32) {
+            if t < 0.85 {
+                seg(self.cine_from, left, ease_in_out(t / 0.85))
+            } else if t < 1.45 {
+                left
+            } else if t < 2.35 {
+                seg(left, right, ease_in_out((t - 1.45) / 0.9))
+            } else if t < 2.95 {
+                right
+            } else {
+                seg(right, centre, ease_in_out((t - 2.95) / 1.05))
+            }
+        };
+        let (cx, cy) = pos(t);
+        let (px, py) = pos((t - 1. / 60.).max(0.));
+        let (vx, vy) = ((cx - px) * 60., (cy - py) * 60.);
+
+        // Grow to the whole screen (a touch beyond, so no edge shows).
+        let g = ease_in_out((t - 2.95) / 1.05);
+        let w = lerp(bw, mw * 1.04, g);
+        let h = lerp(bh, mh * 1.04, g);
+        let radius = lerp(bh / 2., 0., g);
+
+        // Squash and stretch along the motion while still small.
+        let speed = vx.hypot(vy);
+        let s = (speed / (2600. * self.scale)).min(0.28) * (1. - g);
+        let (sx, sy) = if speed > 1. {
+            let (ux, uy) = ((vx / speed).abs(), (vy / speed).abs());
+            (1. + s * (ux - 0.6 * uy), 1. + s * (uy - 0.6 * ux))
+        } else {
+            (1., 1.)
+        };
+
+        // Eyes: look left, then right, then straight ahead; then close.
+        let look = if t < 0.45 {
+            0.
+        } else if t < 1.45 {
+            -ease_in_out((t - 0.45) / 0.35)
+        } else if t < 2.35 {
+            lerp(-1., 1., ease_in_out((t - 1.45) / 0.9))
+        } else if t < 2.95 {
+            1.
+        } else {
+            1. - ease_in_out((t - 2.95) / 0.6)
+        };
+        // A quick double glance at each side.
+        let dart = if (0.95..1.35).contains(&t) || (2.45..2.85).contains(&t) {
+            ((t * 14.).sin() * 0.12).abs()
+        } else {
+            0.
+        };
+        let gap = lerp(10. * ps, h * 0.17, g);
+        let r = lerp(4.5 * ps, h * 0.085, g);
+        let lid = ease_in_out((t - 4.25) / 0.95);
+        let margin = 40. * self.scale;
+        let full = g > 0.;
+        let window = if full {
+            (m.left, m.top, mw as i32, mh as i32)
+        } else {
+            let (ww, wh) = (bw * 1.4 + margin * 2., bh * 1.4 + margin * 2.);
+            (
+                (cx - ww / 2.) as i32,
+                (cy - wh / 2.) as i32,
+                ww as i32,
+                wh as i32,
+            )
+        };
+        CineFrame {
+            centre: (cx, cy),
+            size: (w * sx, h * sy),
+            radius,
+            gap,
+            eye_r: r,
+            look: (look + dart * look.signum()) * r * 1.1,
+            lid,
+            window,
+        }
+    }
+
+    unsafe fn draw_cinematic(&mut self, origin: (i32, i32)) {
+        let f = self.cine_frame();
+        let (cx, cy) = (f.centre.0 - origin.0 as f32, f.centre.1 - origin.1 as f32);
+        let body = R::new(cx - f.size.0 / 2., cy - f.size.1 / 2., f.size.0, f.size.1);
+        let bg = self.color("bg");
+        self.canvas.rrect(body, f.radius, bg);
+        let eye = hex(&self.tokens.colors.visualizer_bar);
+        let open = 1. - f.lid;
+        for side in [-1., 1.] {
+            let ex = cx + side * f.gap + f.look;
+            // Lids come down from the top: the eye flattens and sinks a little.
+            let ry = (f.eye_r * open).max(f.eye_r * 0.06);
+            let ey = cy + f.eye_r * 0.35 * f.lid;
+            self.canvas.ellipse(ex, ey, f.eye_r, ry, eye);
+        }
+    }
+
     fn save_config(&self) {
         if let Ok(p) = store::config_path() {
             let _ = self.config.save(&p);
@@ -1602,6 +1794,13 @@ impl Host {
     unsafe fn render(&mut self) {
         let (x, y, w, h) = self.window_rect();
         self.hits.clear();
+        if self.mode == Mode::Cinematic {
+            // Drawn in device pixels: it ends up covering the whole screen.
+            self.canvas.begin(w, h, 1.);
+            self.draw_cinematic((x, y));
+            self.canvas.present(self.hwnd, (x, y), (w, h));
+            return;
+        }
         self.canvas.begin(w, h, self.scale);
         match self.mode {
             Mode::Docked => self.draw_docked(),
@@ -3001,6 +3200,22 @@ unsafe fn show_menu(hwnd: HWND) {
             t("Acasă (în notch)", "Home (to the notch)").as_ptr(),
         );
     }
+    let linked = with_host(|h| h.phone.is_some()).unwrap_or(false);
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        20,
+        t("Conectează telefonul (QR)…", "Connect your phone (QR)…").as_ptr(),
+    );
+    if linked {
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            21,
+            t("Deconectează telefonul", "Disconnect the phone").as_ptr(),
+        );
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, 1, t("Ieșire", "Exit").as_ptr());
     let mut pt = POINT { x: 0, y: 0 };
@@ -3020,6 +3235,21 @@ unsafe fn show_menu(hwnd: HWND) {
         DestroyWindow(hwnd);
         return;
     }
+    if choice == 20 {
+        match with_host(|h| h.enable_phone()) {
+            Some(Ok(code)) => phone::show_pairing(hwnd, &code, ro),
+            Some(Err(e)) => {
+                MessageBoxW(
+                    hwnd,
+                    wide(&e).as_ptr(),
+                    wide("Mira").as_ptr(),
+                    MB_ICONWARNING,
+                );
+            }
+            None => {}
+        }
+        return;
+    }
     with_host(|h| {
         match choice {
             2 => h.send_home(),
@@ -3027,6 +3257,7 @@ unsafe fn show_menu(hwnd: HWND) {
             10 => h.pet_kind = PetKind::Follow,
             11 => h.pet_kind = PetKind::Pinned,
             12 => h.pet_kind = PetKind::Roam,
+            21 => h.disable_phone(),
             _ => {}
         }
         if (10..=12).contains(&choice) {
@@ -3053,6 +3284,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     h.tick();
                 }
             });
+            0
+        }
+        phone::WM_PHONE_SHAKE => {
+            with_host(|h| h.start_cinematic());
             0
         }
         WM_CONTEXT_READY | WM_SEARCH_PROGRESS => {
@@ -3221,6 +3456,11 @@ pub unsafe fn run() {
     HOST.with(|s| *s.borrow_mut() = Some(state));
     com::register_drop_target(hwnd);
     AddClipboardFormatListener(hwnd);
+    with_host(|h| {
+        if h.config.phone_link {
+            let _ = h.enable_phone();
+        }
+    });
     with_host(|h| h.tick());
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     SetTimer(hwnd, 1, 33, None);
@@ -3421,5 +3661,35 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+// --- phone-shake show timeline ---------------------------------------------------
+
+/// Seconds into the show when the computer locks, and when it is over.
+const CINE_LOCK: f32 = 5.35;
+const CINE_END: f32 = 5.8;
+
+/// One frame of the show, in device px.
+struct CineFrame {
+    centre: (f32, f32),
+    size: (f32, f32),
+    radius: f32,
+    gap: f32,
+    eye_r: f32,
+    /// Horizontal pupil offset (negative = looking left).
+    look: f32,
+    /// 0 = eyes open, 1 = closed.
+    lid: f32,
+    window: (i32, i32, i32, i32),
+}
+
+/// Cubic ease-in-out: speeds up, then slows down.
+fn ease_in_out(t: f32) -> f32 {
+    let t = t.clamp(0., 1.);
+    if t < 0.5 {
+        4. * t * t * t
+    } else {
+        1. - (-2. * t + 2.).powi(3) / 2.
     }
 }

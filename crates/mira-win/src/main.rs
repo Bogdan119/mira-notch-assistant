@@ -12,6 +12,8 @@ mod gfx;
 mod host;
 #[cfg(windows)]
 mod pet;
+#[cfg(windows)]
+mod phone;
 
 /// NUL-terminated UTF-16 for Win32 string parameters.
 #[cfg(windows)]

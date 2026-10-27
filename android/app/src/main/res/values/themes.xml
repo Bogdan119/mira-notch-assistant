@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Mira" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:navigationBarColor">@color/bg</item>
+        <item name="android:colorAccent">@color/accent</item>
+    </style>
+
+    <color name="bg">#0A0A0B</color>
+    <color name="pill">#1C1C22</color>
+    <color name="accent">#5B8CFF</color>
+    <color name="eyes">#8FB0FF</color>
+    <color name="text">#F2F2F3</color>
+    <color name="dim">#9A9AA0</color>
+</resources>
