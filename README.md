@@ -156,7 +156,8 @@ Water, Reminders, Shelf, Notes, Clipboard and Folder. Right-click for Exit.
 
 - **Time-of-flight sensor** (laptops with Lenovo's ST VL53L1, read through
   Windows' custom-sensor API) — right-click → *ToF sensor*:
-  - *lock when I leave*: more than 1 m away for 3 s locks the PC;
+  - *lock when I leave*: more than 1 m away for 3 s plays the sleepy show
+    (look left, look right, fill the screen, close the eyes) and locks the PC;
   - *hand close = minimize all*: a hand within 15 cm of the sensor sends Win+M.
   The hub refreshes about once a second, so hold the hand there for a moment.
   `tools/tof-probe.ps1` shows the live distance if you want to check yours.

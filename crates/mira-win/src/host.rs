@@ -3405,8 +3405,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         sensor::WM_SENSOR_AWAY => {
-            // Nobody at the desk for a few seconds: lock right away.
-            windows_sys::Win32::System::Shutdown::LockWorkStation();
+            // Nobody at the desk: the robot glances left and right, fills the
+            // screen, closes its eyes, and the show ends by locking the PC.
+            with_host(|h| h.start_cinematic());
             0
         }
         sensor::WM_SENSOR_SWIPE => {
