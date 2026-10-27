@@ -2,14 +2,15 @@
 resolver = "2"
 members = [
     "crates/mira-core",
+    "crates/mira-platform-win",
     "crates/mira-platform-linux",
+    "crates/mira-win",
     "crates/mira-daemon",
 ]
 
-# Platform crates and binaries are added to `members` in their own build steps:
-#   crates/mira-platform-win, crates/mira-platform-linux,
-#   crates/mira-win (Windows bin), crates/mira-daemon (Linux bin).
-# Each OS-specific crate is fully cfg-gated so the workspace builds green on any OS.
+# Platform crates: mira-platform-win / mira-win (Windows bin) and
+# mira-platform-linux / mira-daemon (Linux bin). Each OS-specific crate is fully
+# cfg-gated so the workspace builds green on any OS.
 
 [workspace.package]
 version = "0.1.0"

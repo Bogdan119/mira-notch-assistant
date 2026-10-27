@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::lyrics::{Lyrics, LyricsSource};
+use crate::model::{NowPlaying, MICROS_PER_SEC};
 
 const API_BASE: &str = "https://lrclib.net";
 const USER_AGENT: &str = concat!(
@@ -34,6 +35,66 @@ impl TrackQuery {
             ..Default::default()
         }
     }
+
+    /// Build a lookup for the track a media source reports, cleaning up the
+    /// title/artist first (see [`clean_track`]).
+    pub fn for_now_playing(np: &NowPlaying) -> Self {
+        let (title, artist) = clean_track(&np.title, &np.artist);
+        TrackQuery {
+            title,
+            artist,
+            album: np.album.clone(),
+            duration_secs: (np.length_micros > 0).then_some(np.length_micros / MICROS_PER_SEC),
+        }
+    }
+}
+
+/// Normalise a now-playing title/artist for lyric lookup. Browser/YouTube
+/// tracks arrive as a messy single title ("Artist - Song (Official Video)")
+/// with no artist: strip common video-title noise and, when the artist is
+/// empty, split an "Artist - Song" title.
+pub fn clean_track(raw_title: &str, raw_artist: &str) -> (String, String) {
+    let mut title = strip_noise(raw_title);
+    let mut artist = strip_noise(raw_artist);
+    // Drop a channel "- Topic" suffix that YouTube Music adds to the artist.
+    if let Some(stripped) = artist.strip_suffix("- Topic") {
+        artist = stripped.trim().to_string();
+    }
+    if artist.is_empty() {
+        if let Some((a, t)) = title.split_once(" - ") {
+            artist = a.trim().to_string();
+            title = t.trim().to_string();
+        }
+    }
+    (title, artist)
+}
+
+/// Remove bracketed/segment noise such as "(Official Video)", "[Lyrics]",
+/// "(feat. X)", "| NPR", trailing "- YouTube", and collapse whitespace.
+fn strip_noise(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth_paren = 0i32;
+    let mut depth_brack = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '(' => depth_paren += 1,
+            ')' => depth_paren = (depth_paren - 1).max(0),
+            '[' => depth_brack += 1,
+            ']' => depth_brack = (depth_brack - 1).max(0),
+            _ if depth_paren == 0 && depth_brack == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    // Cut anything after a pipe (e.g. "Song | Live at ...").
+    if let Some(idx) = out.find('|') {
+        out.truncate(idx);
+    }
+    let out = out
+        .trim()
+        .trim_end_matches("- YouTube")
+        .trim_end_matches("- Topic")
+        .trim();
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Raw shape of an LRCLIB record (`/api/get` and items from `/api/search`).
@@ -195,5 +256,17 @@ mod tests {
         }"#;
         let record: LrclibRecord = serde_json::from_str(json).unwrap();
         assert!(record.into_lyrics().is_ok());
+    }
+
+    #[test]
+    fn cleans_browser_video_titles() {
+        assert_eq!(
+            clean_track("Daft Punk - One More Time (Official Video)", ""),
+            ("One More Time".to_string(), "Daft Punk".to_string())
+        );
+        assert_eq!(
+            clean_track("Song [Lyrics] | Live", "Band - Topic"),
+            ("Song".to_string(), "Band".to_string())
+        );
     }
 }

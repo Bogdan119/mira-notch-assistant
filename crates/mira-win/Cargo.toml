@@ -1,0 +1,41 @@
+[package]
+name = "mira-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Mira's Windows host: a native Direct2D notch window with a tray icon, wired to GSMTC and PowerManager."
+
+[[bin]]
+name = "mira"
+path = "src/main.rs"
+
+[dependencies]
+mira-core = { path = "../mira-core" }
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+mira-platform-win = { path = "../mira-platform-win" }
+tokio = { workspace = true }
+windows-numerics = "0.3"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

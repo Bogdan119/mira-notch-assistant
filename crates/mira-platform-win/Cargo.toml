@@ -1,0 +1,27 @@
+[package]
+name = "mira-platform-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Windows data sources for Mira (GSMTC media, PowerManager battery) over WinRT."
+
+[dependencies]
+mira-core = { path = "../mira-core" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+dirs = { workspace = true }
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Media_Control",
+    "Storage_Streams",
+    "System_Power",
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+] }
+windows-future = "0.3"
