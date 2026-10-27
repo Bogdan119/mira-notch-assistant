@@ -36,6 +36,11 @@ impl Spring {
         (self.target - self.value).abs() < 0.01 && self.velocity.abs() < 0.01
     }
 
+    pub fn snap_keep_velocity(&mut self, v: f32) {
+        self.value = v;
+        self.target = v;
+    }
+
     pub fn snap(&mut self, v: f32) {
         self.value = v;
         self.target = v;
@@ -57,9 +62,9 @@ pub struct Pet {
 impl Pet {
     pub fn new(x: f32, y: f32) -> Self {
         Pet {
-            x: Spring::new(x, 42., 11.),
-            y: Spring::new(y, 42., 11.),
-            squash: Spring::new(0., 320., 9.),
+            x: Spring::new(x, 160., 22.),
+            y: Spring::new(y, 160., 22.),
+            squash: Spring::new(0., 420., 13.),
             hop: None,
             moving: false,
         }
@@ -77,10 +82,15 @@ impl Pet {
         self.squash.velocity += 6.;
     }
 
-    /// Follow a point directly (while being dragged).
-    pub fn hold(&mut self, x: f32, y: f32) {
-        self.x.target = x;
-        self.y.target = y;
+    /// Stick to the pointer while being dragged: no spring lag, but the
+    /// pointer's (smoothed) velocity still drives the squash-and-stretch.
+    pub fn drag_to(&mut self, x: f32, y: f32, dt: f32) {
+        let dt = dt.max(1. / 240.);
+        let k = 0.35;
+        self.x.velocity += ((x - self.x.value) / dt - self.x.velocity) * k;
+        self.y.velocity += ((y - self.y.value) / dt - self.y.velocity) * k;
+        self.x.snap_keep_velocity(x);
+        self.y.snap_keep_velocity(y);
         self.hop = None;
         self.moving = true;
     }
@@ -90,7 +100,7 @@ impl Pet {
         self.y.step(dt);
         self.squash.step(dt);
         if let Some(t) = self.hop.as_mut() {
-            *t += dt / 0.55;
+            *t += dt / 0.38;
             if *t >= 1. {
                 self.hop = None;
             }
@@ -110,7 +120,7 @@ impl Pet {
     /// Hop height above the spring position, in logical px.
     pub fn lift(&self) -> f32 {
         self.hop
-            .map(|t| (std::f32::consts::PI * t).sin() * 26.)
+            .map(|t| (std::f32::consts::PI * t).sin() * 14.)
             .unwrap_or(0.)
     }
 
@@ -118,7 +128,7 @@ impl Pet {
     pub fn scale(&self) -> (f32, f32) {
         let (vx, vy) = (self.x.velocity, self.y.velocity);
         let speed = vx.hypot(vy);
-        let s = (speed / 2200.).min(0.28);
+        let s = (speed / 2600.).min(0.25);
         let (ux, uy) = if speed > 1. {
             ((vx / speed).abs(), (vy / speed).abs())
         } else {

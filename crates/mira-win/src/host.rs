@@ -25,7 +25,7 @@ use mira_core::{
 };
 use windows_sys::Win32::{
     Foundation::*,
-    Graphics::{Gdi::*, GdiPlus::GpBitmap},
+    Graphics::{Dwm::DwmFlush, Gdi::*, GdiPlus::GpBitmap},
     System::{
         DataExchange::{AddClipboardFormatListener, GetClipboardSequenceNumber},
         LibraryLoader::GetModuleHandleW,
@@ -47,11 +47,12 @@ use crate::wide;
 const OPEN_W: f32 = 640.;
 const OPEN_H: f32 = 272.;
 const HEADER_H: f32 = 48.;
-const BOX_W: f32 = 124.;
-const BOX_H: f32 = 78.;
-/// Pet window: the box plus room for squash, stretch and the hop.
-const PET_WIN_W: f32 = 220.;
-const PET_WIN_H: f32 = 200.;
+/// The detached robot: a pill a bit smaller than the closed notch.
+const BOX_W: f32 = 140.;
+const BOX_H: f32 = 30.;
+/// Pet window: the pill plus room for squash, stretch and the hop.
+const PET_WIN_W: f32 = 200.;
+const PET_WIN_H: f32 = 84.;
 
 const WM_OPEN_EDITOR: u32 = WM_APP + 2;
 const WM_CONTEXT_READY: u32 = WM_APP + 20;
@@ -236,6 +237,8 @@ struct Host {
     dirty: bool,
     /// Horizontal offset of the open layout inside the (animating) notch.
     content_dx: f32,
+    /// Whether the last tick drew a frame (keeps the vsync loop running).
+    rendered: bool,
 }
 
 thread_local! { static HOST: RefCell<Option<Host>> = const { RefCell::new(None) }; }
@@ -334,6 +337,7 @@ impl Host {
             clock_t: 0.,
             dirty: true,
             content_dx: 0.,
+            rendered: false,
         })
     }
 
@@ -477,9 +481,8 @@ impl Host {
         match self.mode {
             Mode::Docked => self.tick_docked(now, dt, inside),
             Mode::Dragging => {
-                self.pet
-                    .hold(cursor.x as f32, cursor.y as f32 + 12. * self.scale);
-                self.pet.step(dt);
+                self.pet.drag_to(cursor.x as f32, cursor.y as f32, dt);
+                self.pet.squash.step(dt);
                 self.dirty = true;
             }
             Mode::Pet => {
@@ -547,6 +550,7 @@ impl Host {
             self.dirty = true;
         }
 
+        self.rendered = self.dirty;
         if self.dirty {
             self.dirty = false;
             self.render();
@@ -1073,7 +1077,7 @@ impl Host {
         self.mode = Mode::Dragging;
         self.open = false;
         self.open_anim.snap(0.);
-        self.pet.hold(screen.x as f32, screen.y as f32);
+        self.pet.drag_to(screen.x as f32, screen.y as f32, 1. / 60.);
         self.dirty = true;
     }
 
@@ -2451,38 +2455,17 @@ impl Host {
         let (sx, sy) = self.pet.scale();
         let lift = self.pet.lift();
         let (cx, cy) = (PET_WIN_W / 2., PET_WIN_H / 2. - lift);
-        // Shadow on the "ground" stays put while it hops.
-        let shadow_w = BOX_W * 0.7 * (1. - lift / 80.);
-        self.canvas.ellipse(
-            PET_WIN_W / 2.,
-            PET_WIN_H / 2. + BOX_H / 2. + 12.,
-            shadow_w / 2.,
-            5.,
-            0x38000000,
-        );
+        // Squash is anchored at the pill's bottom edge, like it sits on the floor.
         self.canvas.push(cx, cy + BOX_H / 2., sx, sy);
         let body = R::new(-BOX_W / 2., -BOX_H, BOX_W, BOX_H);
         let bg = self.color("bg");
-        self.canvas.rrect(body, 24., bg);
-        self.canvas.rrect_stroke(body, 24., 0x30ffffff, 1.);
+        self.canvas.rrect(body, BOX_H / 2., bg);
         self.canvas.reset();
+        // Same eyes as the closed notch, at the centre of the squashed body.
         let eye = hex(&self.tokens.colors.visualizer_bar);
         self.alpha = 1.;
-        // Eyes sit at the centre of the (squashed) body, which is anchored at
-        // its bottom edge.
-        let eye_y = cy + BOX_H / 2. * (1. - sy) - 2.;
-        self.eyes(cx, eye_y, 15. * sx, 7. * sx, 9. * sy, eye, 0.);
-        if self.mode == Mode::Dragging {
-            let hint = self.tr("lasă-mă pe un folder", "drop me on a folder");
-            self.canvas.text(
-                hint,
-                R::new(0., cy + BOX_H / 2. + 18., PET_WIN_W, 18.),
-                11.,
-                Face::Text,
-                0xccf2f2f3,
-                Align::Center,
-            );
-        }
+        let eye_y = cy + BOX_H / 2. * (1. - sy);
+        self.eyes(cx, eye_y, 10. * sx, 4.5 * sx, 4.5 * sy, eye, 0.);
     }
 }
 
@@ -2600,7 +2583,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER => {
-            with_host(|h| h.tick());
+            // Fallback heartbeat for modal loops (menus, drag & drop), which
+            // bypass the frame loop in `run`.
+            with_host(|h| {
+                if h.last_tick.elapsed() > Duration::from_millis(30) {
+                    h.tick();
+                }
+            });
             0
         }
         WM_CONTEXT_READY | WM_SEARCH_PROGRESS => {
@@ -2777,15 +2766,31 @@ pub unsafe fn run() {
     AddClipboardFormatListener(hwnd);
     with_host(|h| h.tick());
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    SetTimer(hwnd, 1, 16, None);
+    SetTimer(hwnd, 1, 33, None);
+    // Frame loop: while anything moves, draw once per display refresh
+    // (DwmFlush waits for the next vsync); when idle, wake every ~33 ms just
+    // to watch the pointer for the eyes.
     let mut message: MSG = std::mem::zeroed();
-    while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
-        let editor = FindWindowW(editor_class.as_ptr(), null());
-        if !editor.is_null() && IsDialogMessageW(editor, &message) != 0 {
-            continue;
+    'frames: loop {
+        while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if message.message == WM_QUIT {
+                break 'frames;
+            }
+            let editor = FindWindowW(editor_class.as_ptr(), null());
+            if !editor.is_null() && IsDialogMessageW(editor, &message) != 0 {
+                continue;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+        let animating = with_host(|h| {
+            h.tick();
+            h.rendered
+        })
+        .unwrap_or(false);
+        if !animating || DwmFlush() != 0 {
+            MsgWaitForMultipleObjects(0, null(), 0, if animating { 8 } else { 33 }, QS_ALLINPUT);
+        }
     }
     HOST.with(|s| *s.borrow_mut() = None);
 }

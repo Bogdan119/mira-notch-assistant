@@ -174,8 +174,8 @@ impl Canvas {
         GdipSetSmoothingMode(self.g, SmoothingModeAntiAlias);
         GdipSetPixelOffsetMode(self.g, PixelOffsetModeHalf);
         GdipSetTextRenderingHint(self.g, TextRenderingHintAntiAliasGridFit);
-        GdipSetInterpolationMode(self.g, InterpolationModeHighQualityBicubic);
-        GdipSetCompositingQuality(self.g, CompositingQualityHighQuality);
+        GdipSetInterpolationMode(self.g, InterpolationModeBilinear);
+        GdipSetCompositingQuality(self.g, CompositingQualityHighSpeed);
         self.cap = (w, h);
     }
 
