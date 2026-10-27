@@ -332,8 +332,11 @@ pub fn start(hwnd: HWND, away: bool, swipe: bool) -> Result<Watcher, String> {
                 "Windows.Devices.Enumeration.DeviceInformation",
                 &IID_IDEVICEINFORMATIONSTATICS,
             )?;
-            let tof = open_custom(statics, devices, TOF_SENSOR);
+            // HOD first: Lenovo's service only starts ranging once a client
+            // holds the HOD sensor. Opened alone (or first), the raw ToF
+            // sensor just repeats its last distance.
             let hod = open_custom(statics, devices, HOD_SENSOR);
+            let tof = open_custom(statics, devices, TOF_SENSOR);
             release(statics);
             release(devices);
             (tof.is_some() || hod.is_some()).then_some((tof, hod))
@@ -461,12 +464,14 @@ mod tests {
                 &IID_IDEVICEINFORMATIONSTATICS,
             )
             .expect("DeviceInformation factory");
+            let hod = open_custom(statics, devices, HOD_SENSOR).expect("HOD sensor");
             let tof = open_custom(statics, devices, TOF_SENSOR).expect("ToF sensor");
             let key = HStr::new(TOF_DISTANCE);
             let mm = read_field(tof, &key).expect("distance field");
             println!("ToF distance: {mm} mm");
             assert!(mm > 0 && mm < 5000);
             release(tof);
+            release(hod);
             release(statics);
             release(devices);
         }
