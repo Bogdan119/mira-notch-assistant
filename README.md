@@ -154,6 +154,13 @@ Water, Reminders, Shelf, Notes, Clipboard and Folder. Right-click for Exit.
     dozes off (it wakes up if the pointer comes close), coughs, and now and
     then shows a thought bubble with CPU, RAM and battery.
 
+- **Time-of-flight sensor** (laptops with Lenovo's ST VL53L1, read through
+  Windows' custom-sensor API) — right-click → *ToF sensor*:
+  - *lock when I leave*: more than 1 m away for 3 s locks the PC;
+  - *hand close = minimize all*: a hand within 15 cm of the sensor sends Win+M.
+  The hub refreshes about once a second, so hold the hand there for a moment.
+  `tools/tof-probe.ps1` shows the live distance if you want to check yours.
+
 Water is stored in `%APPDATA%\Mira\mira.db`; settings, including
 `language = "ro"` or `"en"`, are read from `config.toml` in that folder. The
 installer preserves this personal data on uninstall.

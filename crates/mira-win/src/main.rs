@@ -14,6 +14,8 @@ mod host;
 mod pet;
 #[cfg(windows)]
 mod phone;
+#[cfg(windows)]
+mod sensor;
 
 /// NUL-terminated UTF-16 for Win32 string parameters.
 #[cfg(windows)]

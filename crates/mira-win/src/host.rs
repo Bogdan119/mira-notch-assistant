@@ -44,6 +44,7 @@ use crate::files::{self, FolderContext, Search};
 use crate::gfx::{self, fade, hex, Align, Argb, Canvas, Face, R};
 use crate::pet::{self, Act, CpuMeter, Eyes, PetKind, Rng};
 use crate::phone;
+use crate::sensor;
 use crate::wide;
 
 const OPEN_W: f32 = 640.;
@@ -268,6 +269,7 @@ struct Host {
     /// False for the menu preview: the show ends without locking.
     cine_lock: bool,
     phone: Option<phone::Server>,
+    sensor: Option<sensor::Watcher>,
 }
 
 thread_local! { static HOST: RefCell<Option<Host>> = const { RefCell::new(None) }; }
@@ -386,6 +388,7 @@ impl Host {
             cine_locked: false,
             cine_lock: true,
             phone: None,
+            sensor: None,
         })
     }
 
@@ -1577,6 +1580,55 @@ impl Host {
             let ey = cy + f.eye_r * 0.35 * f.lid;
             self.canvas.ellipse(ex, ey, f.eye_r, ry, eye);
         }
+    }
+
+    /// Start, stop or retune the ToF sensor watcher to match the two modes.
+    unsafe fn apply_sensor_modes(&mut self) -> Result<(), String> {
+        let (away, swipe) = (
+            self.config.sensor_away_lock,
+            self.config.sensor_swipe_minimize,
+        );
+        if !away && !swipe {
+            self.sensor = None;
+            return Ok(());
+        }
+        match &self.sensor {
+            Some(w) => w.set_modes(away, swipe),
+            None => self.sensor = Some(sensor::start(self.hwnd, away, swipe)?),
+        }
+        Ok(())
+    }
+
+    /// Toggle one sensor mode from the menu; reverts it if there's no sensor.
+    unsafe fn toggle_sensor_mode(&mut self, away: bool) -> Result<(), String> {
+        if away {
+            self.config.sensor_away_lock = !self.config.sensor_away_lock;
+        } else {
+            self.config.sensor_swipe_minimize = !self.config.sensor_swipe_minimize;
+        }
+        if let Err(e) = self.apply_sensor_modes() {
+            self.config.sensor_away_lock = false;
+            self.config.sensor_swipe_minimize = false;
+            self.sensor = None;
+            return Err(e);
+        }
+        self.save_config();
+        let on = if away {
+            self.config.sensor_away_lock
+        } else {
+            self.config.sensor_swipe_minimize
+        };
+        let msg = match (away, on, self.ro()) {
+            (true, true, true) => "Senzor: blochez când pleci",
+            (true, true, false) => "Sensor: locking when you leave",
+            (false, true, true) => "Senzor: swipe aproape = minimizez tot",
+            (false, true, false) => "Sensor: close swipe = minimize all",
+            (_, false, true) => "Senzor: mod oprit",
+            (_, false, false) => "Sensor: mode off",
+        };
+        self.pulse = Some(Instant::now());
+        self.toast(msg.to_string());
+        Ok(())
     }
 
     fn save_config(&self) {
@@ -3232,6 +3284,30 @@ unsafe fn show_menu(hwnd: HWND) {
             t("Deconectează telefonul", "Disconnect the phone").as_ptr(),
         );
     }
+    let (away_on, swipe_on) =
+        with_host(|h| (h.config.sensor_away_lock, h.config.sensor_swipe_minimize))
+            .unwrap_or((false, false));
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(
+        menu,
+        MF_STRING | check(away_on),
+        30,
+        t(
+            "Senzor ToF: blochează când pleci (> 1 m)",
+            "ToF sensor: lock when I leave (> 1 m)",
+        )
+        .as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING | check(swipe_on),
+        31,
+        t(
+            "Senzor ToF: mâna aproape (< 15 cm) = minimizează tot",
+            "ToF sensor: hand close (< 15 cm) = minimize all",
+        )
+        .as_ptr(),
+    );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, 1, t("Ieșire", "Exit").as_ptr());
     let mut pt = POINT { x: 0, y: 0 };
@@ -3249,6 +3325,17 @@ unsafe fn show_menu(hwnd: HWND) {
     DestroyMenu(menu);
     if choice == 1 {
         DestroyWindow(hwnd);
+        return;
+    }
+    if choice == 30 || choice == 31 {
+        if let Some(Err(e)) = with_host(|h| h.toggle_sensor_mode(choice == 30)) {
+            MessageBoxW(
+                hwnd,
+                wide(&e).as_ptr(),
+                wide("Mira").as_ptr(),
+                MB_ICONWARNING,
+            );
+        }
         return;
     }
     if choice == 20 {
@@ -3290,6 +3377,17 @@ unsafe fn show_menu(hwnd: HWND) {
     });
 }
 
+/// Win+M: minimize every window, like the shell's "minimize all".
+unsafe fn minimize_all() {
+    let key = |vk: u8, up: bool| {
+        keybd_event(vk, 0, if up { KEYEVENTF_KEYUP } else { 0 }, 0);
+    };
+    key(VK_LWIN as u8, false);
+    key(b'M', false);
+    key(b'M', true);
+    key(VK_LWIN as u8, true);
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_OPEN_EDITOR => {
@@ -3303,6 +3401,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if h.last_tick.elapsed() > Duration::from_millis(30) {
                     h.tick();
                 }
+            });
+            0
+        }
+        sensor::WM_SENSOR_AWAY => {
+            // Nobody at the desk for a few seconds: lock right away.
+            windows_sys::Win32::System::Shutdown::LockWorkStation();
+            0
+        }
+        sensor::WM_SENSOR_SWIPE => {
+            minimize_all();
+            with_host(|h| {
+                h.pulse = Some(Instant::now());
+                h.pet.squash.velocity -= 8.;
+                h.dirty = true;
             });
             0
         }
@@ -3479,6 +3591,9 @@ pub unsafe fn run() {
     with_host(|h| {
         if h.config.phone_link {
             let _ = h.enable_phone();
+        }
+        if let Err(e) = h.apply_sensor_modes() {
+            h.toast(e);
         }
     });
     with_host(|h| h.tick());

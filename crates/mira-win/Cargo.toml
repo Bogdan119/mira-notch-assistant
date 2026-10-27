@@ -10,6 +10,7 @@ mira-core = { path = "../mira-core" }
 
 [target.'cfg(windows)'.dependencies]
 qrcode = { version = "0.14", default-features = false }
+windows-targets = "0.52"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

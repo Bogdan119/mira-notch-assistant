@@ -54,6 +54,10 @@ pub struct Config {
     pub phone_link: bool,
     /// Pairing code the phone must send; generated on first use.
     pub phone_code: String,
+    /// Lock the PC when the ToF sensor sees nobody at the desk (Windows).
+    pub sensor_away_lock: bool,
+    /// A hand passing close to the ToF sensor minimizes all windows (Windows).
+    pub sensor_swipe_minimize: bool,
 
     // --- phase 2 feature settings ---
     /// Daily water goal, in glasses.
@@ -76,6 +80,8 @@ impl Default for Config {
             pet_scale: 1.0,
             phone_link: false,
             phone_code: String::new(),
+            sensor_away_lock: false,
+            sensor_swipe_minimize: false,
             water_goal: 8,
             pomodoro_work_min: 25,
             pomodoro_short_break_min: 5,
