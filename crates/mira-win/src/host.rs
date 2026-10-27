@@ -265,6 +265,8 @@ struct Host {
     cine_start: Instant,
     cine_from: (f32, f32),
     cine_locked: bool,
+    /// False for the menu preview: the show ends without locking.
+    cine_lock: bool,
     phone: Option<phone::Server>,
 }
 
@@ -382,6 +384,7 @@ impl Host {
             cine_start: now,
             cine_from: (0., 0.),
             cine_locked: false,
+            cine_lock: true,
             phone: None,
         })
     }
@@ -1447,6 +1450,7 @@ impl Host {
         self.mode = Mode::Cinematic;
         self.cine_start = Instant::now();
         self.cine_locked = false;
+        self.cine_lock = true;
         self.dirty = true;
     }
 
@@ -1455,7 +1459,9 @@ impl Host {
         self.dirty = true;
         if t >= CINE_LOCK && !self.cine_locked {
             self.cine_locked = true;
-            windows_sys::Win32::System::Shutdown::LockWorkStation();
+            if self.cine_lock {
+                windows_sys::Win32::System::Shutdown::LockWorkStation();
+            }
         }
         if t >= CINE_END {
             // Back in the notch for when the user signs in again.
@@ -3208,6 +3214,16 @@ unsafe fn show_menu(hwnd: HWND) {
         20,
         t("Conectează telefonul (QR)…", "Connect your phone (QR)…").as_ptr(),
     );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        22,
+        t(
+            "Test animație (fără blocare)",
+            "Preview the animation (no lock)",
+        )
+        .as_ptr(),
+    );
     if linked {
         AppendMenuW(
             menu,
@@ -3258,6 +3274,10 @@ unsafe fn show_menu(hwnd: HWND) {
             11 => h.pet_kind = PetKind::Pinned,
             12 => h.pet_kind = PetKind::Roam,
             21 => h.disable_phone(),
+            22 => {
+                h.start_cinematic();
+                h.cine_lock = false;
+            }
             _ => {}
         }
         if (10..=12).contains(&choice) {
