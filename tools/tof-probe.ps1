@@ -51,7 +51,6 @@ function Open-Sensor($guid) {
     $dev = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($sel)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
     if ($dev.Count -eq 0) { return $null }
     $s = Await ($Custom::FromIdAsync($dev[0].Id)) $Custom
-    if ($s) { $s.ReportInterval = $s.MinimumReportInterval }
     $s
 }
 

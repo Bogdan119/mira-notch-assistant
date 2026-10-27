@@ -227,10 +227,9 @@ unsafe fn open_custom(statics: Raw, devices: Raw, id: GUID) -> Option<Raw> {
         statics, device_id, &mut op,
     );
     WindowsDeleteString(device_id);
+    // Only read: the report interval belongs to Lenovo's sensing service,
+    // and changing it can make the hub stop ranging.
     let sensor = wait(op)?;
-    let mut min = 0u32;
-    slot::<unsafe extern "system" fn(Raw, *mut u32) -> HRESULT>(sensor, 7)(sensor, &mut min);
-    slot::<unsafe extern "system" fn(Raw, u32) -> HRESULT>(sensor, 8)(sensor, min.max(20));
     Some(sensor)
 }
 
