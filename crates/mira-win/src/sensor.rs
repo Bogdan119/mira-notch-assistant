@@ -237,6 +237,11 @@ unsafe fn open_custom(statics: Raw, devices: Raw, id: GUID) -> Option<Raw> {
 unsafe fn read_field(sensor: Raw, key: &HStr) -> Option<u32> {
     let mut reading = null_mut();
     slot::<unsafe extern "system" fn(Raw, *mut Raw) -> HRESULT>(sensor, 6)(sensor, &mut reading);
+    reading_field(reading, key)
+}
+
+/// Numeric field `key` of a `CustomSensorReading` (consumes the reference).
+unsafe fn reading_field(reading: Raw, key: &HStr) -> Option<u32> {
     if reading.is_null() {
         return None;
     }
@@ -284,6 +289,61 @@ unsafe fn get<T: Default>(pv: Raw, n: usize) -> Option<T> {
         .then_some(v)
 }
 
+// --- sensors ----------------------------------------------------------------------
+//
+// These sensors never raise `ReadingChanged`, and `GetCurrentReading` keeps
+// returning a stale reading unless the HOD sensor is read *before* the raw ToF
+// one on every round; then both refresh about once a second.
+
+/// An opened custom sensor and the reading field holding its distance.
+struct Live {
+    sensor: Raw,
+    key: HStr,
+}
+
+impl Live {
+    unsafe fn open(statics: Raw, devices: Raw, id: GUID, key: &str) -> Option<Live> {
+        let sensor = open_custom(statics, devices, id)?;
+        Some(Live {
+            sensor,
+            key: HStr::new(key),
+        })
+    }
+
+    unsafe fn poll(&self) -> Option<u32> {
+        read_field(self.sensor, &self.key).filter(|mm| *mm > 0)
+    }
+
+    unsafe fn close(self) {
+        release(self.sensor);
+    }
+}
+
+/// Open HOD first, then the raw ToF: Lenovo's service only ranges once a
+/// client holds the HOD sensor.
+unsafe fn open_both() -> Option<(Option<Live>, Option<Live>)> {
+    let statics = factory(
+        "Windows.Devices.Sensors.Custom.CustomSensor",
+        &IID_ICUSTOMSENSORSTATICS,
+    )?;
+    let devices = factory(
+        "Windows.Devices.Enumeration.DeviceInformation",
+        &IID_IDEVICEINFORMATIONSTATICS,
+    )?;
+    let hod = Live::open(statics, devices, HOD_SENSOR, HOD_DISTANCE);
+    let tof = Live::open(statics, devices, TOF_SENSOR, TOF_DISTANCE);
+    release(statics);
+    release(devices);
+    (tof.is_some() || hod.is_some()).then_some((tof, hod))
+}
+
+/// Read HOD, then ToF — in that order, every round (see above).
+unsafe fn poll_both(tof: &Option<Live>, hod: &Option<Live>) -> (Option<u32>, Option<u32>) {
+    let h = hod.as_ref().and_then(|l| l.poll());
+    let t = tof.as_ref().and_then(|l| l.poll());
+    (t, h)
+}
+
 // --- worker -------------------------------------------------------------------------
 
 /// Running sensor watcher; dropping it stops the thread.
@@ -323,36 +383,16 @@ pub fn start(hwnd: HWND, away: bool, swipe: bool) -> Result<Watcher, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     std::thread::spawn(move || unsafe {
         RoInitialize(1); // multi-threaded apartment
-        let opened = (|| {
-            let statics = factory(
-                "Windows.Devices.Sensors.Custom.CustomSensor",
-                &IID_ICUSTOMSENSORSTATICS,
-            )?;
-            let devices = factory(
-                "Windows.Devices.Enumeration.DeviceInformation",
-                &IID_IDEVICEINFORMATIONSTATICS,
-            )?;
-            // HOD first: Lenovo's service only starts ranging once a client
-            // holds the HOD sensor. Opened alone (or first), the raw ToF
-            // sensor just repeats its last distance.
-            let hod = open_custom(statics, devices, HOD_SENSOR);
-            let tof = open_custom(statics, devices, TOF_SENSOR);
-            release(statics);
-            release(devices);
-            (tof.is_some() || hod.is_some()).then_some((tof, hod))
-        })();
-        let Some((tof, hod)) = opened else {
+        let Some((tof, hod)) = open_both() else {
             let _ = ready_tx.send(Err("No time-of-flight sensor found on this laptop.".into()));
             return;
         };
         let _ = ready_tx.send(Ok(()));
-        let (tof_key, hod_key) = (HStr::new(TOF_DISTANCE), HStr::new(HOD_DISTANCE));
         let mut detector = Detector::new();
         while !stop.load(Ordering::Relaxed) {
             detector.away_enabled = away_flag.load(Ordering::Relaxed);
             detector.swipe_enabled = swipe_flag.load(Ordering::Relaxed);
-            let t = tof.and_then(|s| read_field(s, &tof_key));
-            let h = hod.and_then(|s| read_field(s, &hod_key));
+            let (t, h) = poll_both(&tof, &hod);
             let near = match (t, h) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -368,11 +408,8 @@ pub fn start(hwnd: HWND, away: bool, swipe: bool) -> Result<Watcher, String> {
             }
             std::thread::sleep(Duration::from_millis(60));
         }
-        if let Some(s) = tof {
-            release(s);
-        }
-        if let Some(s) = hod {
-            release(s);
+        for live in [tof, hod].into_iter().flatten() {
+            live.close();
         }
     });
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
@@ -447,33 +484,39 @@ mod tests {
         );
     }
 
-    /// Talks to the real sensor; run on a laptop that has one with
-    /// `cargo test -p mira-win -- --ignored live_sensor`.
+    /// The worker's sensor path on the real hardware for 10 s, printing what
+    /// it reads and what the detector decides. Wave a hand close meanwhile:
+    /// `cargo test -p mira-win -- --ignored live_worker --nocapture`.
     #[test]
     #[ignore]
-    fn live_sensor_reads_distance() {
+    fn live_worker() {
         unsafe {
             RoInitialize(1);
-            let statics = factory(
-                "Windows.Devices.Sensors.Custom.CustomSensor",
-                &IID_ICUSTOMSENSORSTATICS,
-            )
-            .expect("CustomSensor factory");
-            let devices = factory(
-                "Windows.Devices.Enumeration.DeviceInformation",
-                &IID_IDEVICEINFORMATIONSTATICS,
-            )
-            .expect("DeviceInformation factory");
-            let hod = open_custom(statics, devices, HOD_SENSOR).expect("HOD sensor");
-            let tof = open_custom(statics, devices, TOF_SENSOR).expect("ToF sensor");
-            let key = HStr::new(TOF_DISTANCE);
-            let mm = read_field(tof, &key).expect("distance field");
-            println!("ToF distance: {mm} mm");
-            assert!(mm > 0 && mm < 5000);
-            release(tof);
-            release(hod);
-            release(statics);
-            release(devices);
+            let (tof, hod) = open_both().expect("ToF sensors");
+            println!("opened: hod={} tof={}", hod.is_some(), tof.is_some());
+            let mut d = Detector::new();
+            d.away_enabled = true;
+            d.swipe_enabled = true;
+            let start = Instant::now();
+            let mut last = (None, None);
+            while start.elapsed() < Duration::from_secs(10) {
+                let (t, h) = poll_both(&tof, &hod);
+                if (t, h) != last {
+                    println!("{:>6} ms  tof={t:?} hod={h:?}", start.elapsed().as_millis());
+                    last = (t, h);
+                }
+                let near = match (t, h) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if let Some(e) = d.feed(t.or(h), near, Instant::now()) {
+                    println!("{:>6} ms  EVENT {e:?}", start.elapsed().as_millis());
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            for live in [tof, hod].into_iter().flatten() {
+                live.close();
+            }
         }
     }
 
