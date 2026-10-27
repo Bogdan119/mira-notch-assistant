@@ -10,6 +10,8 @@ mod files;
 mod gfx;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod pet;
 
 /// NUL-terminated UTF-16 for Win32 string parameters.
 #[cfg(windows)]

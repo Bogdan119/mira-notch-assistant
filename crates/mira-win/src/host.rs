@@ -42,6 +42,7 @@ use crate::anim::{bounce_in, ease_out, Pet, Spring};
 use crate::com::{self, Clip, Target};
 use crate::files::{self, FolderContext, Search};
 use crate::gfx::{self, fade, hex, Align, Argb, Canvas, Face, R};
+use crate::pet::{self, Act, CpuMeter, Eyes, PetKind, Rng};
 use crate::wide;
 
 const OPEN_W: f32 = 640.;
@@ -50,9 +51,11 @@ const HEADER_H: f32 = 48.;
 /// The detached robot: a pill a bit smaller than the closed notch.
 const BOX_W: f32 = 140.;
 const BOX_H: f32 = 30.;
-/// Pet window: the pill plus room for squash, stretch and the hop.
-const PET_WIN_W: f32 = 200.;
-const PET_WIN_H: f32 = 84.;
+/// Gap kept between the pointer and the following robot, in logical px.
+const FOLLOW_GAP: f32 = 44.;
+/// How long the pointer must be away before the robot sets off after it,
+/// so there is time to click it.
+const FOLLOW_DELAY: Duration = Duration::from_millis(500);
 
 const WM_OPEN_EDITOR: u32 = WM_APP + 2;
 const WM_CONTEXT_READY: u32 = WM_APP + 20;
@@ -199,7 +202,23 @@ struct Host {
     closed_blink: bool,
     pulse: Option<Instant>,
     pet: Pet,
-    next_look: Instant,
+    pet_kind: PetKind,
+    /// User-chosen size of the detached robot (mouse wheel), 1 = default.
+    pet_size: f32,
+    /// Screen origin of the menu panel opened from the detached robot.
+    panel: Option<(i32, i32)>,
+    far_since: Option<Instant>,
+    pending_click: Option<Instant>,
+    drag_from_dock: bool,
+    act: Option<Act>,
+    look_at: Option<(f32, f32)>,
+    beats: u8,
+    rng: Rng,
+    cpu: CpuMeter,
+    bubble: Option<(String, Instant)>,
+    eyes_state: Eyes,
+    /// Where the eyes look instead of the pointer (screen px), when roaming.
+    gaze_at: Option<(f32, f32)>,
 
     last_tick: Instant,
     last_second: Instant,
@@ -284,6 +303,7 @@ impl Host {
             })
             .collect();
         let canvas = Canvas::new().ok_or("GDI+ could not start")?;
+        let pet_size = config.pet_scale.clamp(0.6, 2.5);
         let now = Instant::now();
         Ok(Host {
             tokens: Tokens::embedded()?,
@@ -305,7 +325,20 @@ impl Host {
             closed_blink: false,
             pulse: None,
             pet: Pet::new(0., 0.),
-            next_look: now,
+            pet_kind: PetKind::Follow,
+            pet_size,
+            panel: None,
+            far_since: None,
+            pending_click: None,
+            drag_from_dock: false,
+            act: None,
+            look_at: None,
+            beats: 0,
+            rng: Rng::seeded(),
+            cpu: CpuMeter::new(),
+            bubble: None,
+            eyes_state: Eyes::Open,
+            gaze_at: None,
             last_tick: now,
             last_second: now - Duration::from_secs(1),
             clock: String::new(),
@@ -431,10 +464,13 @@ impl Host {
                 (m.left + (m.right - m.left - w) / 2, m.top, w, h)
             }
             _ => {
-                let (w, h) = (
-                    (PET_WIN_W * self.scale) as i32,
-                    (PET_WIN_H * self.scale) as i32,
-                );
+                if let Some((x, y)) = self.panel {
+                    let w = (OPEN_W * self.scale).ceil() as i32;
+                    let h = (OPEN_H * self.scale).ceil() as i32;
+                    return (x, y, w, h);
+                }
+                let (lw, lh) = self.pet_window();
+                let (w, h) = ((lw * self.scale) as i32, (lh * self.scale) as i32);
                 (
                     self.pet.x.value as i32 - w / 2,
                     self.pet.y.value as i32 - h / 2,
@@ -443,6 +479,29 @@ impl Host {
                 )
             }
         }
+    }
+
+    /// Logical size of the detached robot's window: the pill plus room for
+    /// squash, stretch, the hop and a thought bubble above it.
+    fn pet_window(&self) -> (f32, f32) {
+        let ps = self.pet_size;
+        (
+            (BOX_W * ps * 1.35 + 24.).max(300.),
+            2. * (BOX_H / 2. * ps * 1.3 + 16. + 48.),
+        )
+    }
+
+    /// The pill's half extents in device px.
+    fn pet_half(&self) -> (f32, f32) {
+        (
+            BOX_W / 2. * self.pet_size * self.scale,
+            BOX_H / 2. * self.pet_size * self.scale,
+        )
+    }
+
+    /// Whether the tabbed menu is showing (docked notch or the robot's panel).
+    fn panel_shown(&self) -> bool {
+        self.open && (self.mode == Mode::Docked || self.panel.is_some())
     }
 
     /// Where the robot docks (centre of the closed notch), in device px.
@@ -485,15 +544,7 @@ impl Host {
                 self.pet.squash.step(dt);
                 self.dirty = true;
             }
-            Mode::Pet => {
-                if now >= self.next_look {
-                    self.look_and_follow(cursor);
-                }
-                if self.pet.busy() {
-                    self.pet.step(dt);
-                    self.dirty = true;
-                }
-            }
+            Mode::Pet => self.tick_pet(now, dt, cursor, inside),
             Mode::Returning => {
                 let (hx, hy) = self.home();
                 self.pet.go(hx, hy);
@@ -522,7 +573,7 @@ impl Host {
         }
 
         // Continuous animations.
-        if self.open && self.mode == Mode::Docked {
+        if self.panel_shown() {
             let animated = match self.page {
                 Page::Shelf => !self.shelf.is_empty() || self.file_drag,
                 Page::Notes | Page::Folder => self.edit.is_some(),
@@ -609,32 +660,241 @@ impl Host {
         self.dirty = true;
     }
 
-    /// Every 2–3 s the pet checks where the cursor went and hops after it,
-    /// stopping a little short so it sits beside the pointer, not under it.
-    unsafe fn look_and_follow(&mut self, cursor: POINT) {
-        let jitter = (SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_millis())
-            .unwrap_or(0)
-            % 1000) as u64;
-        self.next_look = Instant::now() + Duration::from_millis(2000 + jitter);
-        let (px, py) = (self.pet.x.value, self.pet.y.value);
-        let (cx, cy) = (cursor.x as f32, cursor.y as f32);
-        let dist = (px - cx).hypot(py - cy);
-        let keep = 110. * self.scale;
-        if dist < keep * 1.2 {
-            // Close enough: a little happy bounce instead of moving.
-            self.pet.squash.velocity -= 5.;
-            self.dirty = true;
+    unsafe fn tick_pet(&mut self, now: Instant, dt: f32, cursor: POINT, inside: bool) {
+        // A single click opens the menu once the double-click window passes
+        // (a double-click sends the robot home instead).
+        if self.pending_click.is_some_and(|t| now >= t) {
+            self.pending_click = None;
+            self.open_panel();
+        }
+        if self.panel.is_some() {
+            self.tick_panel(now, dt, inside);
             return;
         }
-        let k = keep / dist;
-        let (mut tx, mut ty) = (cx + (px - cx) * k, cy + (py - cy) * k);
-        let wa = self.work_area();
-        let (hw, hh) = (BOX_W * self.scale / 2., BOX_H * self.scale / 2.);
-        tx = tx.clamp(wa.left as f32 + hw, wa.right as f32 - hw);
-        ty = ty.clamp(wa.top as f32 + hh + 30. * self.scale, wa.bottom as f32 - hh);
+        self.eyes_state = Eyes::Open;
+        self.gaze_at = None;
+        match self.pet_kind {
+            PetKind::Follow => self.follow(now, cursor),
+            PetKind::Pinned => {}
+            PetKind::Roam => self.roam(now, cursor),
+        }
+        if let Some((_, until)) = &self.bubble {
+            if now >= *until {
+                self.bubble = None;
+            }
+            self.dirty = true;
+        }
+        if self.pet.busy() || self.eyes_state != Eyes::Open {
+            self.pet.step(dt);
+            self.dirty = true;
+        }
+    }
+
+    /// Follow at a polite distance: wait until the pointer has been away for
+    /// half a second (so the robot can be clicked), then hop to a spot a few
+    /// dozen pixels from it — never on top of it.
+    unsafe fn follow(&mut self, now: Instant, cursor: POINT) {
+        let (px, py) = (self.pet.x.value, self.pet.y.value);
+        let (cx, cy) = (cursor.x as f32, cursor.y as f32);
+        let (dx, dy) = (px - cx, py - cy);
+        let dist = dx.hypot(dy).max(1.);
+        let (ux, uy) = (dx / dist, dy / dist);
+        let (hw, hh) = self.pet_half();
+        // Centre distance that leaves FOLLOW_GAP between pointer and pill edge.
+        let keep = FOLLOW_GAP * self.scale + ux.abs() * hw + uy.abs() * hh;
+        if dist < keep * 1.6 || self.pet.busy() {
+            self.far_since = None;
+            return;
+        }
+        let since = *self.far_since.get_or_insert(now);
+        if now.duration_since(since) < FOLLOW_DELAY {
+            return;
+        }
+        self.far_since = None;
+        let (tx, ty) = self.clamp_to_screen(cx + ux * keep, cy + uy * keep);
         self.pet.go(tx, ty);
+        self.dirty = true;
+    }
+
+    unsafe fn clamp_to_screen(&self, x: f32, y: f32) -> (f32, f32) {
+        let wa = self.work_area();
+        let (hw, hh) = self.pet_half();
+        (
+            x.clamp(wa.left as f32 + hw, wa.right as f32 - hw),
+            y.clamp(wa.top as f32 + hh + 40. * self.scale, wa.bottom as f32 - hh),
+        )
+    }
+
+    /// Free roam: one activity at a time, chosen at random.
+    unsafe fn roam(&mut self, now: Instant, cursor: POINT) {
+        let act = match self.act {
+            Some(a) => a,
+            None => {
+                let wa = self.work_area();
+                let (hw, hh) = self.pet_half();
+                let a = pet::next_act(
+                    &mut self.rng,
+                    now,
+                    (
+                        wa.left as f32,
+                        wa.top as f32,
+                        wa.right as f32,
+                        wa.bottom as f32,
+                    ),
+                    (hw, hh),
+                );
+                self.act = Some(a);
+                self.start_act(a);
+                a
+            }
+        };
+        self.eyes_state = act.eyes(now);
+        let done = match act {
+            Act::Wander { x, y, since } => {
+                self.pet.go(x, y);
+                now.duration_since(since) > Duration::from_millis(300) && !self.pet.busy()
+            }
+            Act::Look { until, next } => {
+                if now >= next {
+                    // Mostly the desktop icons on the left, sometimes anywhere.
+                    let wa = self.work_area();
+                    let x = if self.rng.next() % 3 == 0 {
+                        self.rng.range(wa.left as f32, wa.right as f32)
+                    } else {
+                        self.rng
+                            .range(wa.left as f32, wa.left as f32 + 260. * self.scale)
+                    };
+                    let y = self.rng.range(wa.top as f32, wa.bottom as f32);
+                    self.look_at = Some((x, y));
+                    self.act = Some(Act::Look {
+                        until,
+                        next: now + self.rng.ms(500, 1200),
+                    });
+                }
+                self.gaze_at = self.look_at;
+                now >= until
+            }
+            Act::Sleep { until } => {
+                // Wakes up with a start if the pointer comes close.
+                let close = (self.pet.x.value - cursor.x as f32)
+                    .hypot(self.pet.y.value - cursor.y as f32)
+                    < 70. * self.scale;
+                if close {
+                    self.pet.squash.velocity -= 12.;
+                    self.bubble = Some(("!".into(), now + Duration::from_millis(900)));
+                } else {
+                    self.gaze_at = Some((self.pet.x.value, self.pet.y.value + 100.));
+                }
+                close || now >= until
+            }
+            Act::Stats { until } => {
+                self.gaze_at = Some((self.pet.x.value, self.pet.y.value - 200.));
+                now >= until
+            }
+            Act::Cough { start } => {
+                // Three little coughs: a squash and a sideways jolt each.
+                let t = now.duration_since(start).as_secs_f32();
+                let due = [0., 0.33, 0.62].iter().filter(|b| t >= **b).count() as u8;
+                while self.beats < due {
+                    self.beats += 1;
+                    self.pet.squash.velocity += 9.;
+                    let side = if self.beats % 2 == 0 { 1. } else { -1. };
+                    self.pet.x.velocity += side * 220. * self.scale;
+                }
+                t > 1.4
+            }
+            Act::Idle { until } => now >= until,
+        };
+        self.dirty = true;
+        if done {
+            self.act = None;
+            self.look_at = None;
+            let thinking = self
+                .bubble
+                .as_ref()
+                .is_some_and(|(t, _)| t.starts_with("CPU") || t.starts_with('z'));
+            if thinking {
+                self.bubble = None;
+            }
+        }
+    }
+
+    unsafe fn start_act(&mut self, act: Act) {
+        let now = Instant::now();
+        self.beats = 0;
+        match act {
+            Act::Stats { until } => {
+                self.cpu.sample();
+                self.bubble = Some((pet::vitals(self.cpu.percent), until));
+            }
+            Act::Sleep { until } => {
+                self.bubble = Some(("z z Z".into(), until));
+            }
+            Act::Cough { .. } => {
+                let text = if self.ro() { "*cof* *cof*" } else { "*cough*" };
+                self.bubble = Some((text.into(), now + Duration::from_millis(1400)));
+            }
+            // Half the time it mutters about what it's looking at.
+            Act::Look { .. } if self.rng.next() % 2 == 0 => {
+                let text = if self.ro() {
+                    "hmm, ce foldere…"
+                } else {
+                    "hmm, folders…"
+                };
+                self.bubble = Some((text.into(), now + Duration::from_millis(1800)));
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the tabbed menu next to the detached robot, growing out of it.
+    unsafe fn open_panel(&mut self) {
+        let wa = self.work_area();
+        let (w, h) = ((OPEN_W * self.scale) as i32, (OPEN_H * self.scale) as i32);
+        let (_, hh) = self.pet_half();
+        let x = (self.pet.x.value as i32 - w / 2).clamp(wa.left, (wa.right - w).max(wa.left));
+        let top = self.pet.y.value as i32 - hh as i32;
+        let y = if top + h <= wa.bottom {
+            top
+        } else {
+            (self.pet.y.value as i32 + hh as i32 - h).max(wa.top)
+        };
+        self.panel = Some((x, y));
+        self.open_anim.snap(0.);
+        self.set_open(true);
+        self.bubble = None;
+        self.act = None;
+    }
+
+    unsafe fn tick_panel(&mut self, now: Instant, dt: f32, inside: bool) {
+        let keep_open = self.edit.is_some() || self.file_drag || self.press.is_some();
+        if inside {
+            self.away = None;
+        } else if self.open && !keep_open {
+            let since = *self.away.get_or_insert(now);
+            if now.duration_since(since).as_millis()
+                >= self.tokens.notch.hover_close_delay_ms as u128 + 400
+            {
+                self.set_open(false);
+            }
+        }
+        if !self.open_anim.settled() {
+            self.open_anim.step(dt.max(1. / 120.));
+            self.dirty = true;
+        }
+        if !self.open && self.open_anim.value < 0.03 {
+            self.panel = None;
+            self.open_anim.snap(0.);
+            self.far_since = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Close the robot's menu immediately (dragging it, sending it home…).
+    fn close_panel(&mut self) {
+        self.panel = None;
+        self.open = false;
+        self.open_anim.snap(0.);
         self.dirty = true;
     }
 
@@ -649,8 +909,9 @@ impl Host {
                 self.pet.y.value - self.pet.lift() * self.scale,
             ),
         };
-        let dx = (cursor.x as f32 - cx) / self.scale;
-        let dy = (cursor.y as f32 - cy) / self.scale;
+        let (lx, ly) = self.gaze_at.unwrap_or((cursor.x as f32, cursor.y as f32));
+        let dx = (lx - cx) / self.scale;
+        let dy = (ly - cy) / self.scale;
         let distance = dx.hypot(dy).max(1.);
         let strength = (distance / 400.).min(1.);
         let target = (dx / distance * strength * 8., dy / distance * strength * 5.);
@@ -1020,7 +1281,7 @@ impl Host {
 
     unsafe fn mouse_down(&mut self, screen: POINT, local: (f32, f32)) {
         let local = self.to_content(local);
-        let action = if self.mode == Mode::Docked && self.open {
+        let action = if self.panel_shown() {
             self.action_at(local)
         } else {
             None
@@ -1070,10 +1331,15 @@ impl Host {
 
     unsafe fn start_drag(&mut self, screen: POINT) {
         self.end_edit();
+        self.pending_click = None;
+        self.drag_from_dock = self.mode == Mode::Docked;
         if self.mode == Mode::Docked {
             let (x, y, w, h) = self.window_rect();
             self.pet = Pet::new((x + w / 2) as f32, (y + h / 2) as f32);
         }
+        self.panel = None;
+        self.act = None;
+        self.bubble = None;
         self.mode = Mode::Dragging;
         self.open = false;
         self.open_anim.snap(0.);
@@ -1095,9 +1361,49 @@ impl Host {
         }
         if let Some(a) = press.action {
             self.perform(a);
-        } else if self.mode == Mode::Docked && self.edit.is_some() {
+        } else if self.mode == Mode::Pet && self.panel.is_none() {
+            self.pending_click =
+                Some(Instant::now() + Duration::from_millis(GetDoubleClickTime() as u64));
+        } else if self.edit.is_some() {
             self.end_edit();
         }
+    }
+
+    /// Take the robot out of the notch without dragging it.
+    unsafe fn pop_out(&mut self) {
+        let (hx, hy) = self.home();
+        self.set_open(false);
+        self.open_anim.snap(0.);
+        self.pet = Pet::new(hx, hy);
+        self.mode = Mode::Pet;
+        self.pet_kind = PetKind::Follow;
+        self.pet.go(hx, hy + 110. * self.scale);
+        self.dirty = true;
+    }
+
+    fn save_config(&self) {
+        if let Ok(p) = store::config_path() {
+            let _ = self.config.save(&p);
+        }
+    }
+
+    /// Double-click on the robot: back to the notch.
+    fn double_click(&mut self) -> bool {
+        if self.mode != Mode::Pet || self.panel.is_some() {
+            return false;
+        }
+        self.pending_click = None;
+        self.press = None;
+        self.send_home();
+        true
+    }
+
+    fn send_home(&mut self) {
+        self.close_panel();
+        self.act = None;
+        self.bubble = None;
+        self.mode = Mode::Returning;
+        self.dirty = true;
     }
 
     unsafe fn finish_drag(&mut self, screen: POINT) {
@@ -1108,23 +1414,44 @@ impl Host {
         SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex);
 
         let near_top = screen.y - self.monitor().top < (60. * self.scale) as i32;
+        // Flung upwards: it goes home.
+        let (vx, vy) = (self.pet.x.velocity, self.pet.y.velocity);
+        let thrown_up = vy < -1300. * self.scale && -vy > vx.abs() * 1.2;
+        let from_dock = self.drag_from_dock;
         match target {
+            _ if thrown_up => self.send_home(),
             Some(Target::Folder(dir)) => {
                 self.load_context(dir);
-                self.peek_until = Some(Instant::now() + Duration::from_secs(5));
-                self.mode = Mode::Returning;
+                if from_dock {
+                    self.peek_until = Some(Instant::now() + Duration::from_secs(5));
+                    self.mode = Mode::Returning;
+                } else {
+                    self.mode = Mode::Pet;
+                    self.open_panel();
+                }
             }
             Some(Target::File(file)) => {
                 self.add_to_shelf(&[file]);
                 self.page = Page::Shelf;
-                self.peek_until = Some(Instant::now() + Duration::from_secs(3));
-                self.mode = Mode::Returning;
+                if from_dock {
+                    self.peek_until = Some(Instant::now() + Duration::from_secs(3));
+                    self.mode = Mode::Returning;
+                } else {
+                    self.mode = Mode::Pet;
+                    self.open_panel();
+                }
             }
-            None if near_top => self.mode = Mode::Returning,
+            None if near_top => self.send_home(),
             None => {
+                if from_dock {
+                    self.pet_kind = PetKind::Follow;
+                }
                 self.mode = Mode::Pet;
+                // Keep the drag's momentum for a little skid, then settle.
+                self.pet.x.target = self.pet.x.value;
+                self.pet.y.target = self.pet.y.value;
                 self.pet.squash.velocity -= 9.;
-                self.next_look = Instant::now() + Duration::from_millis(1500);
+                self.far_since = None;
             }
         }
         self.dirty = true;
@@ -1132,7 +1459,7 @@ impl Host {
 
     unsafe fn right_click(&mut self, local: (f32, f32)) -> After {
         let local = self.to_content(local);
-        if self.mode == Mode::Docked && self.open {
+        if self.panel_shown() {
             match self.action_at(local) {
                 Some(Action::ShelfOpen(i)) => {
                     self.perform(Action::ShelfRemove(i));
@@ -1158,6 +1485,14 @@ impl Host {
     }
 
     unsafe fn wheel(&mut self, delta: i16) {
+        if self.mode == Mode::Pet && self.panel.is_none() {
+            let factor = 1.1f32.powf(delta as f32 / 120.);
+            self.pet_size = (self.pet_size * factor).clamp(0.6, 2.5);
+            self.config.pet_scale = self.pet_size;
+            self.pet.squash.velocity -= 4.;
+            self.dirty = true;
+            return;
+        }
         let key = self.page as u8;
         let s = self.scroll.entry(key).or_insert(0.);
         *s = (*s - delta as f32 / 120. * 48.).clamp(0., self.scroll_max.max(0.));
@@ -1270,6 +1605,7 @@ impl Host {
         self.canvas.begin(w, h, self.scale);
         match self.mode {
             Mode::Docked => self.draw_docked(),
+            _ if self.panel.is_some() => self.draw_panel(),
             _ => self.draw_pet(),
         }
         self.canvas.present(self.hwnd, (x, y), (w, h));
@@ -1292,10 +1628,11 @@ impl Host {
             .filter(|t| *t < 0.7)
             .map(|t| 1. + (t * 18.).sin() * 0.25 * (1. - t / 0.7))
             .unwrap_or(1.);
-        let h = if self.closed_blink {
-            ry * 0.16
-        } else {
-            ry * pulse
+        let h = match self.eyes_state {
+            _ if self.closed_blink => ry * 0.16,
+            Eyes::Closed => ry * 0.14,
+            Eyes::Squint => ry * 0.45,
+            Eyes::Open => ry * pulse,
         };
         for side in [-1., 1.] {
             let ex = cx + side * gap + self.gaze.0 + beat;
@@ -2452,20 +2789,102 @@ impl Host {
 
     unsafe fn draw_pet(&mut self) {
         self.content_dx = 0.;
-        let (sx, sy) = self.pet.scale();
-        let lift = self.pet.lift();
-        let (cx, cy) = (PET_WIN_W / 2., PET_WIN_H / 2. - lift);
+        let (ww, wh) = self.pet_window();
+        let ps = self.pet_size;
+        let (bw, bh) = (BOX_W * ps, BOX_H * ps);
+        let (mut sx, mut sy) = self.pet.scale();
+        if self.eyes_state == Eyes::Closed {
+            // Slow breathing while asleep.
+            let b = (self.clock_t * 2.2).sin() * 0.035;
+            sx += b * 0.5;
+            sy -= b;
+        }
+        let lift = self.pet.lift() * ps.sqrt();
+        let (cx, cy) = (ww / 2., wh / 2. - lift);
         // Squash is anchored at the pill's bottom edge, like it sits on the floor.
-        self.canvas.push(cx, cy + BOX_H / 2., sx, sy);
-        let body = R::new(-BOX_W / 2., -BOX_H, BOX_W, BOX_H);
+        self.canvas.push(cx, cy + bh / 2., sx, sy);
+        let body = R::new(-bw / 2., -bh, bw, bh);
         let bg = self.color("bg");
-        self.canvas.rrect(body, BOX_H / 2., bg);
+        self.canvas.rrect(body, bh / 2., bg);
         self.canvas.reset();
         // Same eyes as the closed notch, at the centre of the squashed body.
         let eye = hex(&self.tokens.colors.visualizer_bar);
         self.alpha = 1.;
-        let eye_y = cy + BOX_H / 2. * (1. - sy);
-        self.eyes(cx, eye_y, 10. * sx, 4.5 * sx, 4.5 * sy, eye, 0.);
+        let eye_y = cy + bh / 2. * (1. - sy);
+        self.eyes(
+            cx,
+            eye_y,
+            10. * ps * sx,
+            4.5 * ps * sx,
+            4.5 * ps * sy,
+            eye,
+            0.,
+        );
+        self.alpha = 1.;
+        if let Some((text, _)) = self.bubble.clone() {
+            self.thought_bubble(&text, cx, cy - bh / 2. * sy - 6.);
+        }
+    }
+
+    /// A small thought bubble whose tail points down at (x, bottom).
+    unsafe fn thought_bubble(&mut self, text: &str, x: f32, bottom: f32) {
+        let (ww, _) = self.pet_window();
+        let w = (self.canvas.measure(text, 12., Face::Text) + 22.).min(ww - 8.);
+        let h = 26.;
+        let bx = (x - w / 2.).clamp(4., ww - w - 4.);
+        let r = R::new(bx, bottom - h - 12., w, h);
+        let fill = 0xf2f2f2f3;
+        // Pop in with a little bounce.
+        self.canvas.rrect(r, h / 2., fill);
+        self.canvas.ellipse(x + 4., bottom - 8., 3.5, 3.5, fill);
+        self.canvas.ellipse(x + 1., bottom - 2., 2., 2., fill);
+        let mut shown = text.to_string();
+        if text.starts_with('z') {
+            // Animated snore: the z's appear one by one.
+            let n = ((self.clock_t * 1.6) as usize % 3) + 1;
+            shown = ["z", "z z", "z z Z"][n - 1].to_string();
+        }
+        self.canvas
+            .text(&shown, r, 12., Face::Bold, 0xff1a1a1f, Align::Center);
+    }
+
+    /// The tabbed menu opened from the detached robot: it grows out of the
+    /// pill (same spring as the notch) into a rounded panel.
+    unsafe fn draw_panel(&mut self) {
+        self.content_dx = 0.;
+        let Some((ox, oy)) = self.panel else {
+            return;
+        };
+        let t = self.open_anim.value.max(0.);
+        let ps = self.pet_size;
+        let (bw, bh) = (BOX_W * ps, BOX_H * ps);
+        let px = (self.pet.x.value - ox as f32) / self.scale;
+        let py = (self.pet.y.value - oy as f32) / self.scale;
+        let from = R::new(px - bw / 2., py - bh / 2., bw, bh);
+        let to = R::new(0., 0., OPEN_W, OPEN_H);
+        let k = t.min(1.05);
+        let r = R::new(
+            lerp(from.x, to.x, k),
+            lerp(from.y, to.y, k),
+            lerp(from.w, to.w, k),
+            lerp(from.h, to.h, k),
+        );
+        let radius = lerp(bh / 2., 24., t.min(1.));
+        let bg = self.color("bg");
+        self.canvas.rrect(r, radius, bg);
+        let closed_alpha = (1. - t * 2.5).clamp(0., 1.);
+        if closed_alpha > 0. {
+            let eye = fade(hex(&self.tokens.colors.visualizer_bar), closed_alpha);
+            self.eyes(r.cx(), r.cy(), 10. * ps, 4.5 * ps, 4.5 * ps, eye, 0.);
+        }
+        let open_alpha = ease_out((t - 0.45) / 0.55);
+        if open_alpha > 0.01 {
+            self.alpha = open_alpha;
+            self.canvas.clip(r, radius);
+            self.draw_open();
+            self.canvas.unclip();
+        }
+        self.alpha = 1.;
     }
 }
 
@@ -2543,12 +2962,47 @@ unsafe fn after(hwnd: HWND, a: After) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let docked = with_host(|h| h.mode == Mode::Docked).unwrap_or(true);
+    let (docked, kind, ro) = with_host(|h| (h.mode == Mode::Docked, h.pet_kind, h.ro()))
+        .unwrap_or((true, PetKind::Follow, true));
+    let t = |r: &str, e: &str| wide(if ro { r } else { e });
+    let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
     let menu = CreatePopupMenu();
-    if !docked {
-        AppendMenuW(menu, MF_STRING, 2, wide("Acasă / Home").as_ptr());
+    if docked {
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            3,
+            t("Scoate robotelul", "Pop the robot out").as_ptr(),
+        );
+    } else {
+        AppendMenuW(
+            menu,
+            MF_STRING | check(kind == PetKind::Follow),
+            10,
+            t("Urmărește mouse-ul", "Follow the mouse").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | check(kind == PetKind::Pinned),
+            11,
+            t("Pin (stă pe loc)", "Pin (stay here)").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | check(kind == PetKind::Roam),
+            12,
+            t("Free roam", "Free roam").as_ptr(),
+        );
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            2,
+            t("Acasă (în notch)", "Home (to the notch)").as_ptr(),
+        );
     }
-    AppendMenuW(menu, MF_STRING, 1, wide("Mira — Ieșire / Exit").as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(menu, MF_STRING, 1, t("Ieșire", "Exit").as_ptr());
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
@@ -2562,18 +3016,27 @@ unsafe fn show_menu(hwnd: HWND) {
         null(),
     );
     DestroyMenu(menu);
-    match choice {
-        1 => {
-            DestroyWindow(hwnd);
-        }
-        2 => {
-            with_host(|h| {
-                h.mode = Mode::Returning;
-                h.dirty = true;
-            });
-        }
-        _ => {}
+    if choice == 1 {
+        DestroyWindow(hwnd);
+        return;
     }
+    with_host(|h| {
+        match choice {
+            2 => h.send_home(),
+            3 => h.pop_out(),
+            10 => h.pet_kind = PetKind::Follow,
+            11 => h.pet_kind = PetKind::Pinned,
+            12 => h.pet_kind = PetKind::Roam,
+            _ => {}
+        }
+        if (10..=12).contains(&choice) {
+            h.act = None;
+            h.bubble = None;
+            h.far_since = None;
+            h.pet.squash.velocity -= 6.;
+        }
+        h.dirty = true;
+    });
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -2599,7 +3062,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         com::WM_DRAG_ENTER => {
             with_host(|h| {
                 h.file_drag = true;
-                if h.mode == Mode::Docked {
+                if h.mode == Mode::Docked || h.panel.is_some() {
                     if h.page != Page::Folder {
                         h.page = Page::Shelf;
                     }
@@ -2637,15 +3100,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let (screen, local) = local_point(hwnd, lp);
-            let home =
-                msg == WM_LBUTTONDBLCLK && with_host(|h| h.mode == Mode::Pet).unwrap_or(false);
-            if home {
-                with_host(|h| {
-                    h.mode = Mode::Returning;
-                    h.press = None;
-                    h.dirty = true;
-                });
-            } else {
+            let home = msg == WM_LBUTTONDBLCLK && with_host(|h| h.double_click()).unwrap_or(false);
+            if !home {
                 SetCapture(hwnd);
                 with_host(|h| h.mouse_down(screen, local));
             }
@@ -2693,6 +3149,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_DESTROY => {
+            with_host(|h| h.save_config());
             KillTimer(hwnd, 1);
             PostQuitMessage(0);
             0

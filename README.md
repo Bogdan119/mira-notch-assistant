@@ -141,9 +141,18 @@ Water, Reminders, Shelf, Notes, Clipboard and Folder. Right-click for Exit.
   skipping binaries and `.git`/`node_modules`/`target`). Click a hit to open
   it at the line in VS Code when installed. Dropping a folder onto the Folder
   tab works too.
-- **Pet mode** — dropped anywhere else, the robot stays out and every 2–3 s
-  looks where the pointer went and hops after it with a squash-and-stretch.
-  Double-click it (or right-click → Home) to send it back to the notch.
+- **Out of the notch** — dropped anywhere else (or right-click the notch →
+  *Pop the robot out*), the robot stays out as a small pill with the same eyes.
+  Click it to open the tab menu right there; double-click it, or fling it
+  upwards, to send it home. The mouse wheel over it resizes it (remembered in
+  `config.toml` as `pet_scale`). Right-click picks its mood:
+  - *Follow the mouse* — waits half a second after the pointer moves away
+    (so it can be clicked), then hops after it, stopping a few dozen pixels
+    short;
+  - *Pin* — stays where it is put; drag it to move it;
+  - *Free roam* — wanders around on its own, glances at the desktop icons,
+    dozes off (it wakes up if the pointer comes close), coughs, and now and
+    then shows a thought bubble with CPU, RAM and battery.
 
 Water is stored in `%APPDATA%\Mira\mira.db`; settings, including
 `language = "ro"` or `"en"`, are read from `config.toml` in that folder. The

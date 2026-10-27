@@ -48,6 +48,8 @@ pub struct Config {
     pub autostart: bool,
     /// Manual size multiplier on top of the wide-monitor auto scale.
     pub size_scale: f32,
+    /// Size of the robot once dragged out of the notch (Windows).
+    pub pet_scale: f32,
 
     // --- phase 2 feature settings ---
     /// Daily water goal, in glasses.
@@ -67,6 +69,7 @@ impl Default for Config {
             mascot: false,
             autostart: false,
             size_scale: 1.0,
+            pet_scale: 1.0,
             water_goal: 8,
             pomodoro_work_min: 25,
             pomodoro_short_break_min: 5,
