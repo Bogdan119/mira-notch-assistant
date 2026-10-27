@@ -78,6 +78,15 @@ pub struct Colors {
     pub battery_low: String,
     pub charging: String,
     pub separator: String,
+    // Phase-2 page colours.
+    pub ring: String,
+    pub focus: String,
+    pub water: String,
+    #[serde(rename = "waterDim")]
+    pub water_dim: String,
+    pub pill: String,
+    #[serde(rename = "pillHover")]
+    pub pill_hover: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

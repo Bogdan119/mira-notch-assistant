@@ -124,18 +124,35 @@ iscc /DMiraVersion=0.3.0 packaging/windows/mira.iss
 ```
 
 Move the pointer anywhere on the desktop: the resting eyes follow it smoothly
-and blink. Hover to expand; click the title to cycle Music, Pomodoro, Water and Reminders.
-Click the actions below each page to control playback, start/pause/reset focus,
-or adjust water. In Reminders, use + New to enter a title and a delay in minutes; browse reminders with the arrows, snooze with +5 min or acknowledge with Done. Right-click for Exit. Water is stored in `%APPDATA%\Mira\mira.db`;
-settings, including `language = "ro"` or `"en"`, are read from `config.toml` in
-that folder. The installer preserves this personal data on uninstall.
+and blink. Hover to expand; the tab bar switches between Music, Pomodoro,
+Water, Reminders, Shelf, Notes, Clipboard and Folder. Right-click for Exit.
 
-This first Windows host uses system media keys. Track metadata, synced lyrics,
-to-dos, file shelf, battery alerts, fullscreen hiding and tray integration are
-still Linux-only or pending. Test mixed-DPI displays, a real media player,
-water persistence across restart, hover open/close and installer/uninstaller
-on a Windows machine before wider distribution. Linux cross-compilation checks
-buildability but cannot verify Windows UI behavior.
+- **Shelf** — drag files from Explorer onto the notch: it opens and keeps them
+  as shortcuts (paths only, stored in `%APPDATA%\Mira\mira.db`). Click opens a
+  file, dragging a tile takes it back out, right-click removes it.
+- **Notes** — temporary sticky notes: click a note (or "New note") to type,
+  `Ctrl+V` pastes, `Esc` stops editing. Notes live until Mira exits.
+- **Clipboard** — every `Ctrl+C` (text or files) is collected here; click an
+  entry to copy it again. In memory only.
+- **Folder** — pull the robot down from the top: it turns into a little box
+  whose eyes keep watching the pointer. Drop it on a folder (desktop, Explorer
+  file list or navigation pane) to load that folder's files as shortcuts, then
+  search their names and contents grep-style (case-insensitive, multi-threaded,
+  skipping binaries and `.git`/`node_modules`/`target`). Click a hit to open
+  it at the line in VS Code when installed. Dropping a folder onto the Folder
+  tab works too.
+- **Pet mode** — dropped anywhere else, the robot stays out and every 2–3 s
+  looks where the pointer went and hops after it with a squash-and-stretch.
+  Double-click it (or right-click → Home) to send it back to the notch.
+
+Water is stored in `%APPDATA%\Mira\mira.db`; settings, including
+`language = "ro"` or `"en"`, are read from `config.toml` in that folder. The
+installer preserves this personal data on uninstall.
+
+The Windows host uses system media keys. Track metadata, synced lyrics,
+to-dos, battery alerts, fullscreen hiding and tray integration are still
+Linux-only or pending. Branch pushes run `.github/workflows/windows-build.yml`,
+which tests the host and uploads `mira-win.exe` as a workflow artifact.
 
 ## Standalone reminders
 

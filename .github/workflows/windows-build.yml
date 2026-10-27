@@ -1,0 +1,42 @@
+# Windows build for branches and pull requests.
+#
+# Tests the Windows host and uploads `mira-win.exe` as a workflow artifact so a
+# change can be tried before it reaches `main` (which publishes releases via
+# release.yml). Read-only: it never creates tags or releases.
+
+name: windows-build
+
+on:
+  push:
+    branches-ignore: [main]
+    paths-ignore:
+      - 'website/**'
+      - '**/*.md'
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy; rustup default stable
+      - name: Lint
+        run: cargo clippy --locked -p mira-win --all-targets
+      - name: Test
+        run: cargo test --locked -p mira-core -p mira-win
+      - name: Build the Windows binary
+        run: cargo build --release --locked -p mira-win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mira-win-${{ github.sha }}
+          path: target/release/mira-win.exe
+          if-no-files-found: error
